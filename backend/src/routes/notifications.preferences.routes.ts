@@ -6,10 +6,10 @@ import { authMiddleware } from "../middleware/auth.middleware";
 import { validateRequest } from "../middleware/validateRequest";
 import { AuthRequest } from "../services/auth.service";
 
-const notificationChannelSchema = z.enum(["email", "push", "in-app"]);
+const notificationChannelSchema = z.enum(["email", "push", "in-app", "sms"]);
 const preferencesSchema = z.record(
   z.string().min(1),
-  z.array(notificationChannelSchema).max(3),
+  z.array(notificationChannelSchema).max(4),
 );
 
 // Derived from the schema so the event-key/channel shape has a single source
@@ -19,6 +19,21 @@ type Preferences = z.infer<typeof preferencesSchema>;
 // Real Prisma delegate, so argument and result shapes are checked by the
 // compiler instead of being erased behind hand-written `any` signatures.
 type PreferencePrisma = Pick<PrismaClient, "notificationPreference">;
+
+/**
+ * E.164-ish phone number, e.g. "+2348012345678". Deliberately permissive
+ * (no per-country validation) — the SMS provider (Africa's Talking)
+ * validates the number itself and returns a clear per-recipient error we
+ * surface instead of duplicating that logic here.
+ */
+const phoneNumberSchema = z
+  .string()
+  .trim()
+  .regex(/^\+[1-9]\d{7,14}$/, "phoneNumber must be in E.164 format, e.g. +2348012345678");
+
+const smsSettingsBodySchema = z.object({
+  phoneNumber: phoneNumberSchema,
+});
 
 function caller(req: AuthRequest, res: Response): string | null {
   const walletAddress = req.user?.walletAddress?.trim();
@@ -48,11 +63,50 @@ export function createNotificationPreferencesRouter(
         where: { userAddress: walletAddress },
       });
 
-      res.status(200).json({ preferences: normalizePreferences(record?.preferences) });
+      res.status(200).json({
+        preferences: normalizePreferences(record?.preferences),
+        phoneNumber: record?.phoneNumber ?? null,
+      });
     } catch (error) {
       next(error);
     }
   });
+
+  /**
+   * SMS is opt-in per event via `preferences`, but the phone number it goes
+   * to is set separately (never inferred, e.g. from a wallet or profile
+   * field) so a user always explicitly confirms the number that will
+   * receive trade-status texts.
+   */
+  router.put(
+    "/notifications/sms-settings",
+    authMiddleware,
+    validateRequest({ body: smsSettingsBodySchema }),
+    async (req: AuthRequest, res: Response, next) => {
+      try {
+        const walletAddress = caller(req, res);
+        if (!walletAddress) return;
+
+        const { phoneNumber } = req.body as z.infer<typeof smsSettingsBodySchema>;
+        const existing = await prisma.notificationPreference.findUnique({
+          where: { userAddress: walletAddress },
+        });
+
+        const saved = await prisma.notificationPreference.upsert({
+          where: { userAddress: walletAddress },
+          create: { userAddress: walletAddress, preferences: {}, phoneNumber },
+          update: { phoneNumber },
+        });
+
+        res.status(200).json({
+          preferences: normalizePreferences(existing?.preferences ?? {}),
+          phoneNumber: saved.phoneNumber ?? phoneNumber,
+        });
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
 
   router.put(
     "/notifications/preferences",
